@@ -167,15 +167,15 @@ class IntrusionDetectionApp:
             logger.error("Échec de rallumage de la caméra.")
             return "❌ *Erreur* : Impossible de rallumer la caméra USB."
 
-        # Stabilisation de l'exposition et modèle de fond
-        for _ in range(15):
+        # Remise à zéro du modèle d'arrière-plan puis stabilisation sur la luminosité actuelle
+        self.detector.reset()
+        for _ in range(25):
             ret, frame = self.cap.read()
             if ret:
                 self.detector.warmup(frame)
                 with self.frame_lock:
                     self.latest_frame = frame
 
-        self.detector.reset()
         logger.info("🟢 Caméra rallumée et surveillance RÉARMÉE avec succès.")
         return "🟢 *Système RÉARMÉ avec succès.*\nLa caméra a été rallumée et surveille !"
 
@@ -506,11 +506,11 @@ class IntrusionDetectionApp:
                     self.paused_until = 0.0
                     logger.info("🟢 Fin de la période de pause. Rallumage de la caméra...")
                     self.open_camera()
-                    for _ in range(20):
+                    self.detector.reset()
+                    for _ in range(25):
                         ret, frame = self.cap.read()
                         if ret:
                             self.detector.warmup(frame)
-                    self.detector.reset()
                     self.telegram.send_message_async(
                         "🟢 *La pause est terminée.* La caméra a été rallumée et surveille !"
                     )

@@ -21,20 +21,23 @@ class MotionDetector:
     def __init__(
         self,
         min_area: int = 1200,
-        var_threshold: int = 25,
+        var_threshold: int = 35,
         history: int = 500,
         detect_shadows: bool = True,
         consecutive_frames_required: int = 2,
     ):
         self.min_area = min_area
+        self.var_threshold = var_threshold
+        self.history = history
+        self.detect_shadows = detect_shadows
         self.consecutive_frames_required = max(1, consecutive_frames_required)
         self.consecutive_count = 0
 
         # Substracteur d'arrière-plan MOG2 de OpenCV
         self.fgbg = cv2.createBackgroundSubtractorMOG2(
-            history=history,
-            varThreshold=var_threshold,
-            detectShadows=detect_shadows,
+            history=self.history,
+            varThreshold=self.var_threshold,
+            detectShadows=self.detect_shadows,
         )
 
         self.kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
@@ -95,5 +98,10 @@ class MotionDetector:
         )
 
     def reset(self):
-        """Réinitialise les compteurs de détection consécutive."""
+        """Réinitialise les compteurs et recrée un modèle de fond vierge."""
         self.consecutive_count = 0
+        self.fgbg = cv2.createBackgroundSubtractorMOG2(
+            history=self.history,
+            varThreshold=self.var_threshold,
+            detectShadows=self.detect_shadows,
+        )
