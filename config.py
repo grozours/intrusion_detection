@@ -1,7 +1,7 @@
 import os
 import argparse
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, List
 from dotenv import load_dotenv
 
 RESOLUTION_PRESETS = {
@@ -33,6 +33,37 @@ def parse_resolution_string(res_str: str) -> Tuple[int, int]:
     return (640, 480)
 
 
+def parse_exclude_zones(zones_str: str) -> List[Tuple[float, float, float, float]]:
+    """
+    Parse une chaîne définissant une ou plusieurs zones d'exclusion.
+    Formats acceptés :
+      - Pourcentages : "0,75,35,100" (x1=0%, y1=75%, x2=35%, y2=100%)
+      - Plusieurs zones séparées par point-virgule : "0,75,35,100; 80,0,100,50"
+      - Pixels directs : "0,360,250,480"
+    Retourne une liste de tuples (x1, y1, x2, y2).
+    """
+    if not zones_str or not zones_str.strip():
+        return []
+
+    zones = []
+    # Découpage par point-virgule ou barre verticale
+    raw_zones = [z.strip() for z in zones_str.replace("|", ";").split(";") if z.strip()]
+    for raw in raw_zones:
+        cleaned = raw.replace("%", "").replace("(", "").replace(")", "").strip()
+        parts = [p.strip() for p in cleaned.split(",") if p.strip()]
+        if len(parts) == 4:
+            try:
+                x1, y1, x2, y2 = float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
+                if x1 > x2:
+                    x1, x2 = x2, x1
+                if y1 > y2:
+                    y1, y2 = y2, y1
+                zones.append((x1, y1, x2, y2))
+            except ValueError:
+                continue
+    return zones
+
+
 @dataclass
 class AppConfig:
     # Mode & Délais
@@ -45,6 +76,8 @@ class AppConfig:
     resolution: Tuple[int, int]
     min_area: int
     consecutive_frames: int
+    exclude_zones: List[Tuple[float, float, float, float]]
+    auto_door: bool
     show_display: bool
 
     # Stockage
@@ -122,6 +155,21 @@ def parse_args_and_config() -> AppConfig:
         type=int,
         default=int(os.getenv("CONSECUTIVE_FRAMES", "2")),
         help="Nombre de frames consécutives nécessaires pour confirmer le mouvement (défaut: 2).",
+    )
+    parser.add_argument(
+        "-z",
+        "--exclude-zone",
+        "--exclude-zones",
+        type=str,
+        dest="exclude_zones",
+        default=os.getenv("EXCLUDE_ZONES", ""),
+        help="Zone(s) à ignorer pour la détection (ex: '0,75,35,100' pour x:0-35%%, y:75-100%% sous la porte). Séparer par ';' pour plusieurs zones.",
+    )
+    parser.add_argument(
+        "--auto-door",
+        action="store_true",
+        default=os.getenv("AUTO_DOOR", "false").lower() in ("true", "1", "yes"),
+        help="Reconnaître automatiquement la porte au démarrage et exclure ses 20%% inférieurs de la détection.",
     )
     parser.add_argument(
         "-o",
@@ -252,6 +300,8 @@ def parse_args_and_config() -> AppConfig:
     else:
         show_display = False
 
+    exclude_zones = parse_exclude_zones(args.exclude_zones)
+
     return AppConfig(
         is_test_mode=args.test,
         startup_delay=startup_delay,
@@ -260,6 +310,8 @@ def parse_args_and_config() -> AppConfig:
         resolution=target_res,
         min_area=min_area,
         consecutive_frames=args.consecutive_frames,
+        exclude_zones=exclude_zones,
+        auto_door=args.auto_door,
         show_display=show_display,
         output_dir=args.output_dir,
         keep_videos=args.keep_videos,

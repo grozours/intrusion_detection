@@ -8,6 +8,7 @@ import threading
 from typing import Optional
 from datetime import datetime
 import cv2
+import numpy as np
 
 from config import parse_args_and_config
 from motion_detector import MotionDetector
@@ -67,7 +68,15 @@ class IntrusionDetectionApp:
         self.detector = MotionDetector(
             min_area=self.config.min_area,
             consecutive_frames_required=self.config.consecutive_frames,
+            exclude_zones=self.config.exclude_zones,
         )
+
+        # Variables pour la sélection interactive de zones d'exclusion à la souris
+        self.mouse_dragging = False
+        self.mouse_start = None
+        self.mouse_current = None
+        self.display_window_created = False
+        self.last_detected_door = None
 
         # Caméra et caractéristiques du flux
         self.cap = None
@@ -341,11 +350,88 @@ class IntrusionDetectionApp:
         cv2.imwrite(img_path, stamped)
         return img_path
 
+    def _on_mouse_framing(self, event, x, y, flags, param):
+        """Gestion des événements souris pour définir interactivement une zone d'exclusion."""
+        w, h = self.frame_size
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.mouse_dragging = True
+            self.mouse_start = (x, y)
+            self.mouse_current = (x, y)
+        elif event == cv2.EVENT_MOUSEMOVE:
+            if self.mouse_dragging:
+                self.mouse_current = (x, y)
+        elif event == cv2.EVENT_LBUTTONUP:
+            if self.mouse_dragging and self.mouse_start:
+                self.mouse_dragging = False
+                x1, y1 = self.mouse_start
+                x2, y2 = x, y
+                x_min, x_max = min(x1, x2), max(x1, x2)
+                y_min, y_max = min(y1, y2), max(y1, y2)
+                if (x_max - x_min) >= 15 and (y_max - y_min) >= 15:
+                    pct_x1 = round((x_min / w) * 100, 1)
+                    pct_y1 = round((y_min / h) * 100, 1)
+                    pct_x2 = round((x_max / w) * 100, 1)
+                    pct_y2 = round((y_max / h) * 100, 1)
+                    new_zone = (pct_x1, pct_y1, pct_x2, pct_y2)
+                    self.config.exclude_zones.append(new_zone)
+                    self.detector.exclude_zones = list(self.config.exclude_zones)
+                    logger.info("=" * 60)
+                    logger.info("🎯 NOUVELLE ZONE D'EXCLUSION AJOUTÉE (Souris) :")
+                    logger.info(f"   Coordonnées : {pct_x1}%,{pct_y1}% -> {pct_x2}%,{pct_y2}%")
+                    all_zones_str = ";".join(
+                        [f"{z[0]:.0f},{z[1]:.0f},{z[2]:.0f},{z[3]:.0f}" for z in self.config.exclude_zones]
+                    )
+                    logger.info(f"   À copier dans .env : EXCLUDE_ZONES={all_zones_str}")
+                    logger.info("=" * 60)
+                self.mouse_start = None
+                self.mouse_current = None
+
+    def auto_detect_door_exclusion(self, frame: np.ndarray, bottom_ratio: float = 0.20) -> bool:
+        """Détecte automatiquement une porte et exclut les 20% inférieurs."""
+        w, h = self.frame_size
+        candidates = MotionDetector.detect_door_candidates(frame)
+        if not candidates:
+            logger.warning("🚪 Aucune structure de porte évidente détectée automatiquement.")
+            logger.info("   -> Vous pouvez tracer manuellement la zone à la souris dans la fenêtre.")
+            return False
+
+        dx, dy, dw, dh = candidates[0]
+        self.last_detected_door = (dx, dy, dw, dh)
+        zx1, zy1, zx2, zy2 = MotionDetector.calculate_bottom_zone((dx, dy, dw, dh), bottom_ratio)
+
+        pct_x1 = round((zx1 / w) * 100, 1)
+        pct_y1 = round((zy1 / h) * 100, 1)
+        pct_x2 = round((zx2 / w) * 100, 1)
+        pct_y2 = round((zy2 / h) * 100, 1)
+
+        new_zone = (pct_x1, pct_y1, pct_x2, pct_y2)
+        if new_zone not in self.config.exclude_zones:
+            self.config.exclude_zones.append(new_zone)
+            self.detector.exclude_zones = list(self.config.exclude_zones)
+
+        logger.info("=" * 65)
+        logger.info("🚪 PORTE DÉTECTÉE AUTOMATIQUEMENT :")
+        logger.info(f"   Cadre porte : x={dx}, y={dy}, l={dw}, h={dh} (ratio h/l={dh/dw:.2f})")
+        logger.info(f"   Zone sous la porte (bas {int(bottom_ratio*100)}%) exclue :")
+        logger.info(f"   Pixels : [{zx1}, {zy1}] -> [{zx2}, {zy2}]  ({pct_x1}%,{pct_y1}% -> {pct_x2}%,{pct_y2}%)")
+        all_zones_str = ";".join(
+            [f"{z[0]:.0f},{z[1]:.0f},{z[2]:.0f},{z[3]:.0f}" for z in self.config.exclude_zones]
+        )
+        logger.info(f"   À copier dans .env : EXCLUDE_ZONES={all_zones_str}")
+        logger.info("=" * 65)
+        return True
+
     def _render_framing_display(self, frame, motion_result=None, state_str="IDLE"):
         """Affiche une fenêtre graphique d'aide au cadrage avec repères et détection en direct."""
         try:
             preview = frame.copy()
             h, w = preview.shape[:2]
+
+            window_name = "Aide au Cadrage Webcam (Mode Test) - Touche 'q' pour quitter"
+            if not self.display_window_created:
+                cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+                cv2.setMouseCallback(window_name, self._on_mouse_framing)
+                self.display_window_created = True
 
             # 1. Repères de cadrage (Règle des tiers - lignes discrètes)
             grid_color = (70, 70, 70)
@@ -359,7 +445,46 @@ class IntrusionDetectionApp:
             cv2.line(preview, (cx - 15, cy), (cx + 15, cy), (0, 255, 255), 1, cv2.LINE_AA)
             cv2.line(preview, (cx, cy - 15), (cx, cy + 15), (0, 255, 255), 1, cv2.LINE_AA)
 
-            # 2. Dessin des zones de mouvement en direct
+            # 2. Dessin du cadre de la porte détectée si présente
+            if self.last_detected_door:
+                pdx, pdy, pdw, pdh = self.last_detected_door
+                cv2.rectangle(preview, (pdx, pdy), (pdx + pdw, pdy + pdh), (255, 200, 0), 2)
+                cv2.putText(
+                    preview,
+                    f"PORTE ({pdw}x{pdh})",
+                    (pdx + 5, max(20, pdy + 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (255, 200, 0),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+            # 3. Dessin des zones d'exclusion actives (en rouge semi-transparent)
+            if self.config.exclude_zones:
+                overlay_zones = preview.copy()
+                for i, zone in enumerate(self.config.exclude_zones):
+                    zx1, zy1, zx2, zy2 = MotionDetector.resolve_zone_pixels(zone, w, h)
+                    if zx2 > zx1 and zy2 > zy1:
+                        cv2.rectangle(overlay_zones, (zx1, zy1), (zx2, zy2), (0, 0, 180), -1)
+                        cv2.rectangle(preview, (zx1, zy1), (zx2, zy2), (0, 0, 255), 2)
+                        cv2.putText(
+                            preview,
+                            f"ZONE IGNOREE #{i+1} ({zone[0]:.0f}%,{zone[1]:.0f}% -> {zone[2]:.0f}%,{zone[3]:.0f}%)",
+                            (zx1 + 6, max(20, min(h - 10, zy1 + 18))),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.42,
+                            (255, 255, 255),
+                            1,
+                            cv2.LINE_AA,
+                        )
+                cv2.addWeighted(overlay_zones, 0.35, preview, 0.65, 0, preview)
+
+            # 4. Rectangle en cours de tracé manuel à la souris
+            if self.mouse_dragging and self.mouse_start and self.mouse_current:
+                cv2.rectangle(preview, self.mouse_start, self.mouse_current, (0, 255, 255), 2)
+
+            # 5. Dessin des zones de mouvement en direct
             if motion_result and motion_result.bounding_boxes:
                 box_color = (0, 0, 255) if motion_result.detected else (0, 255, 0)
                 for (bx, by, bw, bh) in motion_result.bounding_boxes:
@@ -375,19 +500,19 @@ class IntrusionDetectionApp:
                         cv2.LINE_AA,
                     )
 
-            # 3. Bandeaux d'information (haut et bas)
+            # 6. Bandeaux d'information (haut et bas)
             overlay = preview.copy()
             cv2.rectangle(overlay, (0, 0), (w, 36), (15, 15, 15), -1)
             cv2.rectangle(overlay, (0, h - 30), (w, h), (15, 15, 15), -1)
             cv2.addWeighted(overlay, 0.75, preview, 0.25, 0, preview)
 
-            # Texte supérieur
+            # Texte supérieur avec raccourcis
             cv2.putText(
                 preview,
-                "MODE TEST - AIDE AU CADRAGE  |  Fermer : Touche 'q' ou 'Echap'",
+                "AIDE CADRAGE | Souris: masquer zone | 'd': auto-porte | 'c': effacer | 'q': quitter",
                 (15, 24),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
+                0.48,
                 (0, 255, 255),
                 1,
                 cv2.LINE_AA,
@@ -410,12 +535,19 @@ class IntrusionDetectionApp:
                 cv2.LINE_AA,
             )
 
-            window_name = "Aide au Cadrage Webcam (Mode Test) - Touche 'q' pour quitter"
             cv2.imshow(window_name, preview)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):  # 'q' ou ESC
                 logger.info("Touche 'q' ou Echap pressée. Arrêt du programme...")
                 self.running = False
+            elif key == ord("d"):
+                logger.info("Touche 'd' pressée : recherche automatique d'une porte...")
+                self.auto_detect_door_exclusion(frame)
+            elif key == ord("c"):
+                self.config.exclude_zones.clear()
+                self.detector.exclude_zones.clear()
+                self.last_detected_door = None
+                logger.info("🧹 Zones d'exclusion réinitialisées.")
 
         except cv2.error as e:
             logger.warning(
@@ -434,6 +566,8 @@ class IntrusionDetectionApp:
             for _ in range(30):
                 ret, frame = self.cap.read()
                 if ret:
+                    if self.config.auto_door and not self.config.exclude_zones:
+                        self.auto_detect_door_exclusion(frame)
                     self.detector.warmup(frame)
                     with self.frame_lock:
                         self.latest_frame = frame
@@ -452,6 +586,8 @@ class IntrusionDetectionApp:
         while self.running and (time.time() - t_start) < delay:
             ret, frame = self.cap.read()
             if ret:
+                if self.config.auto_door and not self.config.exclude_zones:
+                    self.auto_detect_door_exclusion(frame)
                 self.detector.warmup(frame)
                 with self.frame_lock:
                     self.latest_frame = frame
