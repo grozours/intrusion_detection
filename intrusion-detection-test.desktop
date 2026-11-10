@@ -4,7 +4,8 @@ Type=Application
 Name=Surveillance (Aide au Cadrage)
 GenericName=Cadrage Webcam
 Comment=Test de détection, aide au cadrage et calibration de la porte
-Exec=bash -c "for d in \$PWD \$HOME/projects/intrusion_detection \$HOME/intrusion_detection; do if [ -f \$d/intrusion_detection_test.sh ]; then cd \$d && exec ./intrusion_detection_test.sh; fi; done; DIR=\$(find \$HOME -maxdepth 4 -type d -name intrusion_detection 2>/dev/null | head -n 1); if [ -n \"\$DIR\" ] && [ -f \"\$DIR/intrusion_detection_test.sh\" ]; then cd \"\$DIR\" && exec ./intrusion_detection_test.sh; fi"
+Exec=HOME/intrusion_detection/intrusion_detection_test.sh
+Path=HOME/intrusion_detection
 Icon=camera-video
 Terminal=true
 StartupNotify=true
