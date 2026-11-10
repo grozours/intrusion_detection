@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Surveillance Intrusion
+GenericName=Vidéosurveillance USB
+Comment=Système de détection d'intrusion par webcam avec alertes Telegram
+Exec=bash -c "for d in \$PWD \$HOME/projects/intrusion_detection \$HOME/intrusion_detection; do if [ -f \$d/intrusion_detection.sh ]; then cd \$d && exec ./intrusion_detection.sh; fi; done; DIR=\$(find \$HOME -maxdepth 4 -type d -name intrusion_detection 2>/dev/null | head -n 1); if [ -n \"\$DIR\" ] && [ -f \"\$DIR/intrusion_detection.sh\" ]; then cd \"\$DIR\" && exec ./intrusion_detection.sh; fi"
+Icon=camera-web
+Terminal=true
+StartupNotify=true
+Categories=AudioVideo;Video;
+Keywords=webcam;surveillance;securite;intrusion;alarme;
