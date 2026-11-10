@@ -218,6 +218,14 @@ class TestIntrusionDetection(unittest.TestCase):
             self.assertEqual(app.state, "IDLE")
             self.assertFalse(app.is_armed)
 
+            # 3. Test de l'interruption immédiate du délai d'attente lors d'une pause
+            app.config.startup_delay = 60.0
+            app.is_armed = True
+            app.paused_until = time.time() + 1800  # En pause
+            t0 = time.time()
+            app.run_startup_delay()
+            self.assertLess(time.time() - t0, 1.0, "Le délai d'attente doit s'interrompre immédiatement en cas de pause")
+
 
 if __name__ == "__main__":
     unittest.main()

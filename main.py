@@ -168,6 +168,16 @@ class IntrusionDetectionApp:
                 self.cap = None
                 logger.info("🔌 Caméra éteinte matériellement (veille).")
 
+    def read_frame(self) -> tuple[bool, Optional[np.ndarray]]:
+        """Lit une frame de la caméra de manière thread-safe."""
+        with self.camera_lock:
+            if self.cap is not None and self.cap.isOpened():
+                try:
+                    return self.cap.read()
+                except Exception:
+                    return False, None
+            return False, None
+
     # --- Actions de contrôle à distance (Telegram) ---
 
     def arm(self) -> str:
@@ -196,8 +206,8 @@ class IntrusionDetectionApp:
         first_frame = None
 
         for _ in range(25):
-            ret, frame = self.cap.read()
-            if ret:
+            ret, frame = self.read_frame()
+            if ret and frame is not None:
                 if first_frame is None:
                     first_frame = frame.copy()
                 self.detector.warmup(frame)
@@ -621,8 +631,10 @@ class IntrusionDetectionApp:
             logger.info("⚡ [MODE TEST ACTIF] Démarrage immédiat sans délai d'attente.")
             door_calculated = False
             for _ in range(30):
-                ret, frame = self.cap.read()
-                if ret:
+                if not self.running or not self.is_armed or (time.time() < self.paused_until):
+                    return
+                ret, frame = self.read_frame()
+                if ret and frame is not None:
                     if self.config.auto_door and not door_calculated:
                         self.auto_detect_door_exclusion(frame)
                         door_calculated = True
@@ -643,8 +655,15 @@ class IntrusionDetectionApp:
 
         # 1. Attente pendant le délai d'armement sans polluer le modèle de fond avec vos mouvements
         while self.running and (time.time() - t_start) < delay:
-            ret, frame = self.cap.read()
-            if ret:
+            # Si l'utilisateur désarme ou met en pause via Telegram pendant le compte à rebours
+            if not self.is_armed or (time.time() < self.paused_until):
+                logger.info(
+                    "🛑 Période d'armement initial interrompue (système désarmé ou mis en pause via Telegram)."
+                )
+                return
+
+            ret, frame = self.read_frame()
+            if ret and frame is not None:
                 with self.frame_lock:
                     self.latest_frame = frame
                 if self.config.show_display:
@@ -660,13 +679,15 @@ class IntrusionDetectionApp:
             time.sleep(0.01)
 
         # 2. Calibrage et détection automatique de la porte à la FIN du délai (pièce vide et porte fermée)
-        if self.running:
+        if self.running and self.is_armed and (time.time() >= self.paused_until):
             logger.info("🎯 Fin du délai d'attente. Calibrage de l'arrière-plan et détection de la porte...")
             self.detector.reset()
             first_clean_frame = None
             for _ in range(30):
-                ret, frame = self.cap.read()
-                if ret:
+                if not self.running or not self.is_armed or (time.time() < self.paused_until):
+                    return
+                ret, frame = self.read_frame()
+                if ret and frame is not None:
                     if first_clean_frame is None:
                         first_clean_frame = frame.copy()
                         if self.config.auto_door:
@@ -735,8 +756,10 @@ class IntrusionDetectionApp:
                     self.detector.reset()
                     first_frame = None
                     for _ in range(25):
-                        ret, frame = self.cap.read()
-                        if ret:
+                        if not self.running or not self.is_armed:
+                            break
+                        ret, frame = self.read_frame()
+                        if ret and frame is not None:
                             if first_frame is None:
                                 first_frame = frame.copy()
                             self.detector.warmup(frame)
@@ -758,8 +781,7 @@ class IntrusionDetectionApp:
                         time.sleep(1.0)
                         continue
 
-                with self.camera_lock:
-                    ret, frame = self.cap.read() if self.cap else (False, None)
+                ret, frame = self.read_frame()
 
                 if not ret or frame is None:
                     time.sleep(0.05)
