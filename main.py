@@ -594,10 +594,10 @@ class IntrusionDetectionApp:
     def run_startup_delay(self):
         """Délai d'attente avant armement (1 minute par défaut, 0s si mode test)."""
         delay = self.config.startup_delay
-        door_calculated = False
 
         if delay <= 0:
             logger.info("⚡ [MODE TEST ACTIF] Démarrage immédiat sans délai d'attente.")
+            door_calculated = False
             for _ in range(30):
                 ret, frame = self.cap.read()
                 if ret:
@@ -614,22 +614,19 @@ class IntrusionDetectionApp:
         logger.info(
             f"⏳ Période d'armement initial : surveillance active dans {delay:.0f} secondes."
         )
-        logger.info("   (Ce délai vous permet de quitter la pièce et calibre la caméra)")
+        logger.info("   (Ce délai vous permet de quitter la pièce et de fermer la porte)")
 
         t_start = time.time()
         last_log_second = int(delay)
 
+        # 1. Attente pendant le délai d'armement sans polluer le modèle de fond avec vos mouvements
         while self.running and (time.time() - t_start) < delay:
             ret, frame = self.cap.read()
             if ret:
-                if self.config.auto_door and not door_calculated:
-                    self.auto_detect_door_exclusion(frame)
-                    door_calculated = True
-                self.detector.warmup(frame)
                 with self.frame_lock:
                     self.latest_frame = frame
                 if self.config.show_display:
-                    self._render_framing_display(frame, None, "ARMEMENT")
+                    self._render_framing_display(frame, None, "ATTENTE SORTIE")
 
             remaining = int(delay - (time.time() - t_start))
             if remaining != last_log_second and (
@@ -640,7 +637,24 @@ class IntrusionDetectionApp:
 
             time.sleep(0.01)
 
+        # 2. Calibrage et détection automatique de la porte à la FIN du délai (pièce vide et porte fermée)
         if self.running:
+            logger.info("🎯 Fin du délai d'attente. Calibrage de l'arrière-plan et détection de la porte...")
+            self.detector.reset()
+            first_clean_frame = None
+            for _ in range(30):
+                ret, frame = self.cap.read()
+                if ret:
+                    if first_clean_frame is None:
+                        first_clean_frame = frame.copy()
+                        if self.config.auto_door:
+                            self.auto_detect_door_exclusion(first_clean_frame)
+                    self.detector.warmup(frame)
+                    with self.frame_lock:
+                        self.latest_frame = frame
+                    if self.config.show_display:
+                        self._render_framing_display(frame, None, "CALIBRATION")
+
             logger.info("🔔 SYSTÈME ARMÉ ET PRÊT. Surveillance des mouvements en cours.")
 
     def run(self):
