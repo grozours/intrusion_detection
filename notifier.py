@@ -37,13 +37,19 @@ class EmailNotifier:
         self.email_to = email_to.strip()
         self.mock = mock
 
-        # Si les identifiants SMTP ne sont pas renseignés, on passe en mode simulation
-        if not self.mock and (not self.smtp_host or not self.email_to):
-            logger.warning(
-                "Configuration SMTP incomplète (hôte ou destinataire manquant). "
-                "Mode SIMULATION activé pour les e-mails."
-            )
-            self.mock = True
+        # Si SMTP_USER est vide (et hors mode mock explicite), on désactive totalement les alertes e-mail
+        if not self.smtp_user and not self.mock:
+            self.enabled = False
+            logger.info("🔕 Alertes e-mail désactivées (SMTP_USER non renseigné).")
+        else:
+            self.enabled = True
+            # Si les identifiants SMTP ne sont pas renseignés alors qu'un utilisateur est spécifié
+            if not self.mock and (not self.smtp_host or not self.email_to):
+                logger.warning(
+                    "Configuration SMTP incomplète (hôte ou destinataire manquant). "
+                    "Mode SIMULATION activé pour les e-mails."
+                )
+                self.mock = True
 
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="EmailSender")
 
@@ -55,6 +61,9 @@ class EmailNotifier:
         image_path: str = None,
     ):
         """Lance l'envoi d'un e-mail en arrière-plan sans bloquer la boucle vidéo."""
+        if not self.enabled:
+            return
+
         self.executor.submit(
             self._send_email_worker, subject, body_text, video_path, image_path
         )

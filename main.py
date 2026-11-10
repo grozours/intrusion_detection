@@ -71,12 +71,14 @@ class IntrusionDetectionApp:
             exclude_zones=self.config.exclude_zones,
         )
 
-        # Variables pour la sélection interactive de zones d'exclusion à la souris
+        # Variables pour la gestion des zones d'exclusion
+        self.manual_exclude_zones = list(self.config.exclude_zones)
+        self.auto_door_zone = None
+        self.last_detected_door = None
         self.mouse_dragging = False
         self.mouse_start = None
         self.mouse_current = None
         self.display_window_created = False
-        self.last_detected_door = None
 
         # Caméra et caractéristiques du flux
         self.cap = None
@@ -178,15 +180,27 @@ class IntrusionDetectionApp:
 
         # Remise à zéro du modèle d'arrière-plan puis stabilisation sur la luminosité actuelle
         self.detector.reset()
+        door_msg_part = ""
+        first_frame = None
+
         for _ in range(25):
             ret, frame = self.cap.read()
             if ret:
+                if first_frame is None:
+                    first_frame = frame.copy()
                 self.detector.warmup(frame)
                 with self.frame_lock:
                     self.latest_frame = frame
 
+        # Recalcul automatique de la zone de la porte au réarmement
+        if self.config.auto_door and first_frame is not None:
+            if self.auto_detect_door_exclusion(first_frame):
+                door_msg_part = "\n🚪 *Porte recalculée* : zone basse (20%) masquée."
+            elif self.auto_door_zone:
+                door_msg_part = "\n🚪 *Porte* : zone précédente maintenue (faible luminosité)."
+
         logger.info("🟢 Caméra rallumée et surveillance RÉARMÉE avec succès.")
-        return "🟢 *Système RÉARMÉ avec succès.*\nLa caméra a été rallumée et surveille !"
+        return f"🟢 *Système RÉARMÉ avec succès.*{door_msg_part}\nLa caméra a été rallumée et surveille !"
 
     def disarm(self) -> str:
         """Désarme le système et éteint matériellement la caméra."""
@@ -246,11 +260,17 @@ class IntrusionDetectionApp:
 
         cam_state = "Éteinte 🔌 (repos)" if (self.cap is None) else "Allumée ⚡"
         res_str = f"{self.frame_size[0]}x{self.frame_size[1]}"
+        email_state = (
+            "Désactivées (SMTP_USER vide)"
+            if not self.notifier.enabled
+            else ("Simulation" if self.notifier.mock else f"Actives ({self.config.smtp_user})")
+        )
 
         return (
             f"🛡️ *État du système de vidéosurveillance :*\n\n"
             f"• État : {state_str}\n"
             f"• Matériel caméra : *{cam_state}* (#{self.config.camera_index}, {res_str} @ {self.fps:.0f} FPS)\n"
+            f"• Alertes e-mail : {email_state}\n"
             f"• Alertes déclenchées : {self.alerts_count}\n"
             f"• Heure locale : {now_str}\n"
         )
@@ -373,8 +393,12 @@ class IntrusionDetectionApp:
                     pct_x2 = round((x_max / w) * 100, 1)
                     pct_y2 = round((y_max / h) * 100, 1)
                     new_zone = (pct_x1, pct_y1, pct_x2, pct_y2)
-                    self.config.exclude_zones.append(new_zone)
-                    self.detector.exclude_zones = list(self.config.exclude_zones)
+                    self.manual_exclude_zones.append(new_zone)
+                    active_zones = list(self.manual_exclude_zones)
+                    if self.auto_door_zone and self.auto_door_zone not in active_zones:
+                        active_zones.append(self.auto_door_zone)
+                    self.config.exclude_zones = active_zones
+                    self.detector.exclude_zones = list(active_zones)
                     logger.info("=" * 60)
                     logger.info("🎯 NOUVELLE ZONE D'EXCLUSION AJOUTÉE (Souris) :")
                     logger.info(f"   Coordonnées : {pct_x1}%,{pct_y1}% -> {pct_x2}%,{pct_y2}%")
@@ -392,7 +416,10 @@ class IntrusionDetectionApp:
         candidates = MotionDetector.detect_door_candidates(frame)
         if not candidates:
             logger.warning("🚪 Aucune structure de porte évidente détectée automatiquement.")
-            logger.info("   -> Vous pouvez tracer manuellement la zone à la souris dans la fenêtre.")
+            if self.auto_door_zone:
+                logger.info(f"   -> Maintien de la zone précédemment détectée : {self.auto_door_zone}")
+            else:
+                logger.info("   -> Vous pouvez tracer manuellement la zone à la souris dans la fenêtre.")
             return False
 
         dx, dy, dw, dh = candidates[0]
@@ -404,20 +431,24 @@ class IntrusionDetectionApp:
         pct_x2 = round((zx2 / w) * 100, 1)
         pct_y2 = round((zy2 / h) * 100, 1)
 
-        new_zone = (pct_x1, pct_y1, pct_x2, pct_y2)
-        if new_zone not in self.config.exclude_zones:
-            self.config.exclude_zones.append(new_zone)
-            self.detector.exclude_zones = list(self.config.exclude_zones)
+        self.auto_door_zone = (pct_x1, pct_y1, pct_x2, pct_y2)
+        # Recomposer la liste : zones manuelles + zone porte recalculée
+        active_zones = list(self.manual_exclude_zones)
+        if self.auto_door_zone not in active_zones:
+            active_zones.append(self.auto_door_zone)
+
+        self.config.exclude_zones = active_zones
+        self.detector.exclude_zones = list(active_zones)
 
         logger.info("=" * 65)
-        logger.info("🚪 PORTE DÉTECTÉE AUTOMATIQUEMENT :")
+        logger.info("🚪 PORTE DÉTECTÉE / RECALCULÉE AUTOMATIQUEMENT :")
         logger.info(f"   Cadre porte : x={dx}, y={dy}, l={dw}, h={dh} (ratio h/l={dh/dw:.2f})")
         logger.info(f"   Zone sous la porte (bas {int(bottom_ratio*100)}%) exclue :")
         logger.info(f"   Pixels : [{zx1}, {zy1}] -> [{zx2}, {zy2}]  ({pct_x1}%,{pct_y1}% -> {pct_x2}%,{pct_y2}%)")
         all_zones_str = ";".join(
             [f"{z[0]:.0f},{z[1]:.0f},{z[2]:.0f},{z[3]:.0f}" for z in self.config.exclude_zones]
         )
-        logger.info(f"   À copier dans .env : EXCLUDE_ZONES={all_zones_str}")
+        logger.info(f"   Zones actives : EXCLUDE_ZONES={all_zones_str}")
         logger.info("=" * 65)
         return True
 
@@ -544,6 +575,8 @@ class IntrusionDetectionApp:
                 logger.info("Touche 'd' pressée : recherche automatique d'une porte...")
                 self.auto_detect_door_exclusion(frame)
             elif key == ord("c"):
+                self.manual_exclude_zones.clear()
+                self.auto_door_zone = None
                 self.config.exclude_zones.clear()
                 self.detector.exclude_zones.clear()
                 self.last_detected_door = None
@@ -561,13 +594,16 @@ class IntrusionDetectionApp:
     def run_startup_delay(self):
         """Délai d'attente avant armement (1 minute par défaut, 0s si mode test)."""
         delay = self.config.startup_delay
+        door_calculated = False
+
         if delay <= 0:
             logger.info("⚡ [MODE TEST ACTIF] Démarrage immédiat sans délai d'attente.")
             for _ in range(30):
                 ret, frame = self.cap.read()
                 if ret:
-                    if self.config.auto_door and not self.config.exclude_zones:
+                    if self.config.auto_door and not door_calculated:
                         self.auto_detect_door_exclusion(frame)
+                        door_calculated = True
                     self.detector.warmup(frame)
                     with self.frame_lock:
                         self.latest_frame = frame
@@ -586,8 +622,9 @@ class IntrusionDetectionApp:
         while self.running and (time.time() - t_start) < delay:
             ret, frame = self.cap.read()
             if ret:
-                if self.config.auto_door and not self.config.exclude_zones:
+                if self.config.auto_door and not door_calculated:
                     self.auto_detect_door_exclusion(frame)
+                    door_calculated = True
                 self.detector.warmup(frame)
                 with self.frame_lock:
                     self.latest_frame = frame
@@ -643,12 +680,23 @@ class IntrusionDetectionApp:
                     logger.info("🟢 Fin de la période de pause. Rallumage de la caméra...")
                     self.open_camera()
                     self.detector.reset()
+                    first_frame = None
                     for _ in range(25):
                         ret, frame = self.cap.read()
                         if ret:
+                            if first_frame is None:
+                                first_frame = frame.copy()
                             self.detector.warmup(frame)
+
+                    door_msg = ""
+                    if self.config.auto_door and first_frame is not None:
+                        if self.auto_detect_door_exclusion(first_frame):
+                            door_msg = "\n🚪 *Porte recalculée* : zone basse (20%) masquée."
+                        elif self.auto_door_zone:
+                            door_msg = "\n🚪 *Porte* : zone précédente maintenue (faible luminosité)."
+
                     self.telegram.send_message_async(
-                        "🟢 *La pause est terminée.* La caméra a été rallumée et surveille !"
+                        f"🟢 *La pause est terminée.* La caméra a été rallumée et surveille !{door_msg}"
                     )
 
                 # Si la caméra n'est pas ouverte alors qu'on est armé

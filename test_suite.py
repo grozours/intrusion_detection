@@ -44,6 +44,20 @@ class TestIntrusionDetection(unittest.TestCase):
         notifier.shutdown()
         self.assertTrue(True)
 
+    def test_email_notifier_disabled_when_user_empty(self):
+        """Vérifie que le notificateur e-mail est désactivé si smtp_user est vide."""
+        notifier = EmailNotifier(
+            smtp_host="smtp.gmail.com",
+            smtp_user="",
+            smtp_password="",
+            email_to="test@test.com",
+            mock=False,
+        )
+        self.assertFalse(notifier.enabled)
+        # L'appel à send_alert_async ne doit rien soumettre ni lever d'exception
+        notifier.send_alert_async("Sujet", "Corps")
+        notifier.shutdown()
+
     def test_motion_detector_static_and_motion(self):
         """Vérifie que le détecteur ignore les images fixes et réagit au mouvement."""
         detector = MotionDetector(min_area=500, consecutive_frames_required=2)
