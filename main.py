@@ -86,8 +86,10 @@ class IntrusionDetectionApp:
         self.frame_size = self.config.resolution
         self.fps_calibrated = False
 
-        # Enregistreur vidéo actif
+        # Enregistreur vidéo actif et état de la surveillance
         self.current_segment = None
+        self.state = "IDLE"
+        self.segment_lock = threading.Lock()
 
         # Gestion des signaux d'interruption
         signal.signal(signal.SIGINT, self._handle_exit_signal)
@@ -172,6 +174,16 @@ class IntrusionDetectionApp:
         """Réarme le système de surveillance et rallume la caméra."""
         self.is_armed = True
         self.paused_until = 0.0
+        self.state = "IDLE"
+
+        with self.segment_lock:
+            if self.current_segment:
+                try:
+                    self.current_segment.discard()
+                except Exception:
+                    pass
+                self.current_segment = None
+
         logger.info("🟢 Demande de réarmement reçue via Telegram.")
 
         if not self.open_camera():
@@ -206,13 +218,15 @@ class IntrusionDetectionApp:
         """Désarme le système et éteint matériellement la caméra."""
         self.is_armed = False
         self.paused_until = 0.0
+        self.state = "IDLE"
 
-        if self.current_segment:
-            try:
-                self.current_segment.discard()
-            except Exception:
-                pass
-            self.current_segment = None
+        with self.segment_lock:
+            if self.current_segment:
+                try:
+                    self.current_segment.discard()
+                except Exception:
+                    pass
+                self.current_segment = None
 
         self.detector.reset()
         self.release_camera()
@@ -227,14 +241,16 @@ class IntrusionDetectionApp:
         """Met la surveillance en pause et éteint la caméra."""
         self.is_armed = True
         self.paused_until = time.time() + (minutes * 60)
+        self.state = "IDLE"
         end_time_str = datetime.fromtimestamp(self.paused_until).strftime("%H:%M:%S")
 
-        if self.current_segment:
-            try:
-                self.current_segment.discard()
-            except Exception:
-                pass
-            self.current_segment = None
+        with self.segment_lock:
+            if self.current_segment:
+                try:
+                    self.current_segment.discard()
+                except Exception:
+                    pass
+                self.current_segment = None
 
         self.detector.reset()
         self.release_camera()
@@ -255,16 +271,22 @@ class IntrusionDetectionApp:
         elif time.time() < self.paused_until:
             rem_min = max(1, int((self.paused_until - time.time()) / 60))
             state_str = f"⏸️ *En pause* (~{rem_min} min restantes)"
+        elif self.state == "RECORD_INITIAL_3S":
+            state_str = "🚨 *Enregistrement alerte (3s)*"
+        elif self.state == "RECORD_CYCLE_10S":
+            state_str = "🚨 *Enregistrement alerte continue (10s)*"
         else:
             state_str = "🟢 *Armé & En veille active*"
 
         cam_state = "Éteinte 🔌 (repos)" if (self.cap is None) else "Allumée ⚡"
         res_str = f"{self.frame_size[0]}x{self.frame_size[1]}"
-        email_state = (
-            "Désactivées (SMTP_USER vide)"
-            if not self.notifier.enabled
-            else ("Simulation" if self.notifier.mock else f"Actives ({self.config.smtp_user})")
-        )
+        if not self.notifier.enabled:
+            email_state = "Désactivées (non configuré)"
+        elif self.notifier.mock:
+            email_state = "Simulation"
+        else:
+            clean_email = (self.config.smtp_user or "").replace("_", "\\_")
+            email_state = f"Actives ({clean_email})"
 
         return (
             f"🛡️ *État du système de vidéosurveillance :*\n\n"
@@ -668,7 +690,7 @@ class IntrusionDetectionApp:
         self.run_startup_delay()
 
         # États : "IDLE", "RECORD_INITIAL_3S", "RECORD_CYCLE_10S"
-        state = "IDLE"
+        self.state = "IDLE"
         cycle_number = 0
         cycle_had_motion = False
         initial_alert_sent = False
@@ -677,6 +699,14 @@ class IntrusionDetectionApp:
             while self.running:
                 # 1. Vérification si le système est DÉSARMÉ à distance
                 if not self.is_armed:
+                    self.state = "IDLE"
+                    with self.segment_lock:
+                        if self.current_segment:
+                            try:
+                                self.current_segment.discard()
+                            except Exception:
+                                pass
+                            self.current_segment = None
                     if self.cap is not None:
                         self.release_camera()
                     time.sleep(0.2)
@@ -684,6 +714,14 @@ class IntrusionDetectionApp:
 
                 # 2. Vérification si le système est EN PAUSE temporaire
                 if time.time() < self.paused_until:
+                    self.state = "IDLE"
+                    with self.segment_lock:
+                        if self.current_segment:
+                            try:
+                                self.current_segment.discard()
+                            except Exception:
+                                pass
+                            self.current_segment = None
                     if self.cap is not None:
                         self.release_camera()
                     time.sleep(0.2)
@@ -691,6 +729,7 @@ class IntrusionDetectionApp:
                 elif self.paused_until > 0.0:
                     # La pause vient de se terminer ! Réarmement et allumage automatique
                     self.paused_until = 0.0
+                    self.state = "IDLE"
                     logger.info("🟢 Fin de la période de pause. Rallumage de la caméra...")
                     self.open_camera()
                     self.detector.reset()
@@ -733,7 +772,7 @@ class IntrusionDetectionApp:
                 now_time_str = now.strftime("%H:%M:%S")
                 now_date_str = now.strftime("%d/%m/%Y")
 
-                if state == "IDLE":
+                if self.state == "IDLE":
                     # Détection passive de mouvement
                     motion = self.detector.process_frame(frame)
                     if self.config.show_display:
@@ -746,34 +785,47 @@ class IntrusionDetectionApp:
                         )
 
                         # Démarrage immédiat de l'enregistrement de 3 secondes à T=0
-                        self.current_segment = VideoSegment(
-                            output_dir=self.config.output_dir,
-                            prefix="alerte_initial_3s",
-                            fps=self.fps,
-                            frame_size=self.frame_size,
-                        )
-                        self.current_segment.write(
-                            frame,
-                            motion_area=motion.moving_area,
-                            boxes=motion.bounding_boxes,
-                        )
+                        with self.segment_lock:
+                            self.current_segment = VideoSegment(
+                                output_dir=self.config.output_dir,
+                                prefix="alerte_initial_3s",
+                                fps=self.fps,
+                                frame_size=self.frame_size,
+                            )
+                            self.current_segment.write(
+                                frame,
+                                motion_area=motion.moving_area,
+                                boxes=motion.bounding_boxes,
+                            )
                         initial_alert_sent = False
-                        state = "RECORD_INITIAL_3S"
+                        self.state = "RECORD_INITIAL_3S"
 
-                elif state == "RECORD_INITIAL_3S":
+                elif self.state == "RECORD_INITIAL_3S":
+                    with self.segment_lock:
+                        if (
+                            self.current_segment is None
+                            or not self.is_armed
+                            or (time.time() < self.paused_until)
+                        ):
+                            self.state = "IDLE"
+                            continue
+                        segment = self.current_segment
+
                     motion = self.detector.process_frame(frame)
                     if self.config.show_display:
                         self._render_framing_display(frame, motion, "ENREGISTREMENT 3S")
 
-                    self.current_segment.write(
-                        frame,
-                        motion_area=motion.moving_area,
-                        boxes=motion.bounding_boxes,
-                    )
+                    with self.segment_lock:
+                        if self.current_segment is not None:
+                            self.current_segment.write(
+                                frame,
+                                motion_area=motion.moving_area,
+                                boxes=motion.bounding_boxes,
+                            )
 
                     # Étape 1 : Prise de photo après 0.5s pour que l'intrus soit bien entré
                     if not initial_alert_sent and (
-                        self.current_segment.elapsed() >= self.config.initial_photo_delay
+                        segment.elapsed() >= self.config.initial_photo_delay
                     ):
                         snapshot_instant_path = self._save_instant_snapshot(
                             frame, motion.bounding_boxes
@@ -810,7 +862,7 @@ class IntrusionDetectionApp:
 
                         initial_alert_sent = True
 
-                    if self.current_segment.elapsed() >= 3.0:
+                    if segment.elapsed() >= 3.0:
                         # Sécurité : envoyer la photo initiale si non encore fait
                         if not initial_alert_sent:
                             snapshot_instant_path = self._save_instant_snapshot(
@@ -830,7 +882,12 @@ class IntrusionDetectionApp:
                             initial_alert_sent = True
 
                         # Étape 2 terminée : envoi vidéo 3s
-                        result = self.current_segment.finish()
+                        with self.segment_lock:
+                            if self.current_segment is None:
+                                self.state = "IDLE"
+                                continue
+                            result = self.current_segment.finish()
+                            self.current_segment = None
 
                         # Envoi E-mail
                         subject = f"📹 [ALERTE VIDÉO 3s] Extrait initial - {now_time_str}"
@@ -865,31 +922,49 @@ class IntrusionDetectionApp:
                         logger.info(
                             f"Démarrage du cycle 10s #{cycle_number} de surveillance continue..."
                         )
-                        self.current_segment = VideoSegment(
-                            output_dir=self.config.output_dir,
-                            prefix=f"alerte_continue_10s_cycle{cycle_number}",
-                            fps=self.fps,
-                            frame_size=self.frame_size,
-                        )
-                        state = "RECORD_CYCLE_10S"
+                        with self.segment_lock:
+                            self.current_segment = VideoSegment(
+                                output_dir=self.config.output_dir,
+                                prefix=f"alerte_continue_10s_cycle{cycle_number}",
+                                fps=self.fps,
+                                frame_size=self.frame_size,
+                            )
+                        self.state = "RECORD_CYCLE_10S"
 
-                elif state == "RECORD_CYCLE_10S":
+                elif self.state == "RECORD_CYCLE_10S":
+                    with self.segment_lock:
+                        if (
+                            self.current_segment is None
+                            or not self.is_armed
+                            or (time.time() < self.paused_until)
+                        ):
+                            self.state = "IDLE"
+                            continue
+                        segment = self.current_segment
+
                     motion = self.detector.process_frame(frame)
                     if motion.detected:
                         cycle_had_motion = True
 
-                    self.current_segment.write(
-                        frame,
-                        motion_area=motion.moving_area,
-                        boxes=motion.bounding_boxes,
-                    )
+                    with self.segment_lock:
+                        if self.current_segment is not None:
+                            self.current_segment.write(
+                                frame,
+                                motion_area=motion.moving_area,
+                                boxes=motion.bounding_boxes,
+                            )
 
-                    if self.current_segment.elapsed() >= 10.0:
+                    if segment.elapsed() >= 10.0:
                         if cycle_had_motion:
                             logger.info(
                                 f"Mouvement toujours actif durant le cycle #{cycle_number}."
                             )
-                            result = self.current_segment.finish()
+                            with self.segment_lock:
+                                if self.current_segment is None:
+                                    self.state = "IDLE"
+                                    continue
+                                result = self.current_segment.finish()
+                                self.current_segment = None
 
                             # Envoi E-mail
                             subject = (
@@ -928,25 +1003,28 @@ class IntrusionDetectionApp:
                             logger.info(
                                 f"Démarrage du cycle 10s #{cycle_number} de surveillance continue..."
                             )
-                            self.current_segment = VideoSegment(
-                                output_dir=self.config.output_dir,
-                                prefix=f"alerte_continue_10s_cycle{cycle_number}",
-                                fps=self.fps,
-                                frame_size=self.frame_size,
-                            )
+                            with self.segment_lock:
+                                self.current_segment = VideoSegment(
+                                    output_dir=self.config.output_dir,
+                                    prefix=f"alerte_continue_10s_cycle{cycle_number}",
+                                    fps=self.fps,
+                                    frame_size=self.frame_size,
+                                )
                         else:
                             logger.info(
                                 "Aucun mouvement détecté durant les 10 dernières secondes. "
                                 "Fin de l'événement d'alerte."
                             )
-                            if self.config.keep_videos:
-                                self.current_segment.finish()
-                            else:
-                                self.current_segment.discard()
+                            with self.segment_lock:
+                                if self.current_segment is not None:
+                                    if self.config.keep_videos:
+                                        self.current_segment.finish()
+                                    else:
+                                        self.current_segment.discard()
+                                    self.current_segment = None
 
                             self.detector.reset()
-                            self.current_segment = None
-                            state = "IDLE"
+                            self.state = "IDLE"
                             logger.info("Retour en veille active. En attente de mouvement...")
 
         finally:
@@ -957,12 +1035,13 @@ class IntrusionDetectionApp:
         logger.info("Libération des ressources...")
         self.telegram.stop()
 
-        if self.current_segment:
-            try:
-                self.current_segment.finish()
-            except Exception:
-                pass
-            self.current_segment = None
+        with self.segment_lock:
+            if self.current_segment:
+                try:
+                    self.current_segment.finish()
+                except Exception:
+                    pass
+                self.current_segment = None
 
         self.release_camera()
         self.notifier.shutdown()

@@ -153,6 +153,12 @@ class TelegramService:
                     time.sleep(retry_after)
                     continue
 
+                if response.status_code == 400:
+                    logger.warning(
+                        f"[Telegram] Erreur de syntaxe/formatage (400) sur {endpoint} : {response.text[:120]}"
+                    )
+                    return False
+
                 logger.warning(
                     f"[Telegram] Réponse HTTP {response.status_code} ({response.text[:120]}) "
                     f"sur {endpoint} (tentative {attempt}/{max_retries})"
@@ -322,38 +328,57 @@ class TelegramService:
     def _handle_disarm(self):
         msg = "🔴 Le système a été *DÉSARMÉ*. La détection de mouvement est coupée."
         if self.on_disarm:
-            res = self.on_disarm()
-            if res:
-                msg = res
+            try:
+                res = self.on_disarm()
+                if res:
+                    msg = res
+            except Exception as e:
+                logger.error(f"Erreur lors du désarmement : {e}", exc_info=True)
+                msg = f"❌ *Erreur lors du désarmement :* {e}"
         self.send_message_async(msg, reply_markup=self.main_keyboard)
 
     def _handle_arm(self):
         msg = "🟢 Le système a été *RÉARMÉ*. Surveillance active !"
         if self.on_arm:
-            res = self.on_arm()
-            if res:
-                msg = res
+            try:
+                res = self.on_arm()
+                if res:
+                    msg = res
+            except Exception as e:
+                logger.error(f"Erreur lors du réarmement : {e}", exc_info=True)
+                msg = f"❌ *Erreur lors du réarmement :* {e}"
         self.send_message_async(msg, reply_markup=self.main_keyboard)
 
     def _handle_pause(self, minutes: int):
         msg = f"⏸️ Surveillance mise en pause pour *{minutes} minutes*."
         if self.on_pause:
-            res = self.on_pause(minutes)
-            if res:
-                msg = res
+            try:
+                res = self.on_pause(minutes)
+                if res:
+                    msg = res
+            except Exception as e:
+                logger.error(f"Erreur lors de la mise en pause : {e}", exc_info=True)
+                msg = f"❌ *Erreur lors de la mise en pause :* {e}"
         self.send_message_async(msg, reply_markup=self.main_keyboard)
 
     def _handle_status(self):
         msg = "ℹ️ Statut du système inconnu."
         if self.on_status:
-            msg = self.on_status()
+            try:
+                msg = self.on_status()
+            except Exception as e:
+                logger.error(f"Erreur lors de la récupération du statut : {e}", exc_info=True)
+                msg = f"❌ *Erreur statut :* {e}"
         self.send_message_async(msg, reply_markup=self.main_keyboard)
 
     def _handle_photo_request(self):
         self.send_message_async("📸 Capture de la caméra en cours...")
         photo_path = None
         if self.on_photo_request:
-            photo_path = self.on_photo_request()
+            try:
+                photo_path = self.on_photo_request()
+            except Exception as e:
+                logger.error(f"Erreur lors de la capture photo : {e}", exc_info=True)
 
         if photo_path and os.path.exists(photo_path):
             now_str = time.strftime("%H:%M:%S")
@@ -370,7 +395,7 @@ class TelegramService:
     # --- Méthodes d'envoi réseau résilientes et asynchrones ---
 
     def send_message(self, text: str, reply_markup=None) -> bool:
-        """Envoie un message texte sur Telegram (synchrone avec retries)."""
+        """Envoie un message texte sur Telegram (synchrone avec retries et fallback texte brut)."""
         if not self.enabled or not self.chat_id:
             return False
 
@@ -382,7 +407,13 @@ class TelegramService:
         if reply_markup:
             payload["reply_markup"] = reply_markup
 
-        return self._post_with_retry("sendMessage", json_data=payload, timeout=(5.0, 15.0))
+        success = self._post_with_retry("sendMessage", json_data=payload, timeout=(5.0, 15.0))
+        if not success and "parse_mode" in payload:
+            # Fallback automatique en texte brut si une entité Markdown n'a pas pu être analysée
+            payload.pop("parse_mode")
+            success = self._post_with_retry("sendMessage", json_data=payload, timeout=(5.0, 15.0), max_retries=1)
+
+        return success
 
     def send_message_async(self, text: str, reply_markup=None):
         """Envoie un message texte en arrière-plan sans bloquer la boucle principale."""
@@ -408,13 +439,25 @@ class TelegramService:
 
             files_dict = {"photo": (filename, photo_bytes)}
             # Timeout : 5s pour se connecter, 35s pour transférer la photo
-            return self._post_with_retry(
+            success = self._post_with_retry(
                 "sendPhoto",
                 data=data,
                 files_dict=files_dict,
                 timeout=(5.0, 35.0),
                 max_retries=3,
             )
+            if not success and "parse_mode" in data:
+                # Fallback sans parse_mode en cas d'erreur Markdown
+                data.pop("parse_mode")
+                files_dict = {"photo": (filename, photo_bytes)}
+                success = self._post_with_retry(
+                    "sendPhoto",
+                    data=data,
+                    files_dict=files_dict,
+                    timeout=(5.0, 35.0),
+                    max_retries=1,
+                )
+            return success
         except Exception as e:
             logger.error(f"Échec lecture photo {photo_path} : {e}")
             return False
@@ -443,13 +486,25 @@ class TelegramService:
 
             files_dict = {"video": (filename, video_bytes)}
             # Timeout : 5s pour se connecter, 60s pour transférer la vidéo
-            return self._post_with_retry(
+            success = self._post_with_retry(
                 "sendVideo",
                 data=data,
                 files_dict=files_dict,
                 timeout=(5.0, 60.0),
                 max_retries=3,
             )
+            if not success and "parse_mode" in data:
+                # Fallback sans parse_mode en cas d'erreur Markdown
+                data.pop("parse_mode")
+                files_dict = {"video": (filename, video_bytes)}
+                success = self._post_with_retry(
+                    "sendVideo",
+                    data=data,
+                    files_dict=files_dict,
+                    timeout=(5.0, 60.0),
+                    max_retries=1,
+                )
+            return success
         except Exception as e:
             logger.error(f"Échec lecture vidéo {video_path} : {e}")
             return False

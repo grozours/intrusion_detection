@@ -175,6 +175,49 @@ class TestIntrusionDetection(unittest.TestCase):
         self.assertEqual(parse_exclude_zones(""), [])
         self.assertEqual(parse_exclude_zones("invalide, format"), [])
 
+    def test_status_str_and_concurrent_disarm(self):
+        """Vérifie la robustesse du statut Markdown et du désarmement pendant l'enregistrement."""
+        from main import IntrusionDetectionApp
+        from unittest.mock import MagicMock, patch
+
+        with patch("main.parse_args_and_config") as mock_cfg_parser, \
+             patch("main.TelegramService"), \
+             patch("main.EmailNotifier"):
+            mock_cfg = MagicMock()
+            mock_cfg.min_area = 500
+            mock_cfg.consecutive_frames = 2
+            mock_cfg.exclude_zones = []
+            mock_cfg.resolution = (640, 480)
+            mock_cfg.camera_index = 0
+            mock_cfg.smtp_user = "user_name_test@domain.com"
+            mock_cfg.telegram_alerts = True
+            mock_cfg.output_dir = self.test_dir
+            mock_cfg_parser.return_value = mock_cfg
+
+            app = IntrusionDetectionApp()
+            app.notifier.enabled = True
+            app.notifier.mock = False
+
+            # 1. Vérification du formatage du statut
+            status_text = app.get_status_str()
+            self.assertIn("user\\_name\\_test@domain.com", status_text)
+            self.assertNotIn("SMTP_USER", status_text)
+
+            # 2. Simulation d'un segment d'enregistrement en cours
+            app.current_segment = VideoSegment(
+                output_dir=self.test_dir,
+                prefix="test_concurrent",
+                fps=20.0,
+                frame_size=(320, 240),
+            )
+            app.state = "RECORD_CYCLE_10S"
+
+            # Désarmement (simulé depuis le thread Telegram)
+            app.disarm()
+            self.assertIsNone(app.current_segment)
+            self.assertEqual(app.state, "IDLE")
+            self.assertFalse(app.is_armed)
+
 
 if __name__ == "__main__":
     unittest.main()
