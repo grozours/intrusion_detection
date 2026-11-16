@@ -78,6 +78,8 @@ class AppConfig:
     consecutive_frames: int
     exclude_zones: List[Tuple[float, float, float, float]]
     auto_door: bool
+    human_only: bool
+    human_confidence: float
     show_display: bool
 
     # Stockage
@@ -170,6 +172,23 @@ def parse_args_and_config() -> AppConfig:
         action="store_true",
         default=os.getenv("AUTO_DOOR", "false").lower() in ("true", "1", "yes"),
         help="Reconnaître automatiquement la porte au démarrage et exclure ses 20%% inférieurs de la détection.",
+    )
+    parser.add_argument(
+        "--human-only",
+        action="store_true",
+        default=os.getenv("HUMAN_ONLY", "true").lower() in ("true", "1", "yes"),
+        help="Détecter uniquement la présence d'un humain par IA YOLOv8n (activé par défaut).",
+    )
+    parser.add_argument(
+        "--all-motion",
+        action="store_true",
+        help="Désactiver le filtre IA humain et déclencher sur tout mouvement de pixels (MOG2 classique).",
+    )
+    parser.add_argument(
+        "--human-confidence",
+        type=float,
+        default=float(os.getenv("HUMAN_CONFIDENCE", "0.50")),
+        help="Seuil de confiance IA (0.10 à 0.95) pour valider la présence d'un humain (défaut: 0.50).",
     )
     parser.add_argument(
         "-o",
@@ -301,6 +320,8 @@ def parse_args_and_config() -> AppConfig:
         show_display = False
 
     exclude_zones = parse_exclude_zones(args.exclude_zones)
+    human_only = False if args.all_motion else bool(args.human_only)
+    human_confidence = max(0.10, min(0.95, float(args.human_confidence)))
 
     return AppConfig(
         is_test_mode=args.test,
@@ -312,6 +333,8 @@ def parse_args_and_config() -> AppConfig:
         consecutive_frames=args.consecutive_frames,
         exclude_zones=exclude_zones,
         auto_door=args.auto_door,
+        human_only=human_only,
+        human_confidence=human_confidence,
         show_display=show_display,
         output_dir=args.output_dir,
         keep_videos=args.keep_videos,

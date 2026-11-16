@@ -1,7 +1,18 @@
+import os
+import time
+import logging
+import urllib.request
 import cv2
 import numpy as np
-from dataclasses import dataclass
-from typing import List, Tuple
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional
+
+logger = logging.getLogger("IntrusionDetection.Detector")
+
+DEFAULT_YOLO_MODEL_URL = "https://huggingface.co/Kalray/yolov8/resolve/main/yolov8n.onnx"
+DEFAULT_YOLO_MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "models", "yolov8n.onnx"
+)
 
 
 @dataclass
@@ -10,13 +21,16 @@ class MotionResult:
     moving_area: float
     contours_count: int
     bounding_boxes: List[Tuple[int, int, int, int]]
+    confidences: List[float] = field(default_factory=list)
 
 
 class MotionDetector:
     """
-    Détecteur de mouvement par soustraction d'arrière-plan (MOG2).
-    Intègre un filtrage des ombres, du bruit, un seuil de surface minimum,
-    et le masquage de zones d'exclusion (pour ignorer l'éclairage sous une porte, etc.).
+    Détecteur d'intrusion supportant :
+    1. Mode IA Humain uniquement (YOLOv8n ONNX via OpenCV DNN) : ignore 100% des
+       variations de lumière, ombres, reflets et objets non humains.
+    2. Mode Classique (soustraction d'arrière-plan MOG2) : détection de mouvement pixel.
+    Intègre également le masquage de zones d'exclusion.
     """
 
     def __init__(
@@ -27,6 +41,10 @@ class MotionDetector:
         detect_shadows: bool = True,
         consecutive_frames_required: int = 2,
         exclude_zones: List[Tuple[float, float, float, float]] = None,
+        human_only: bool = False,
+        human_confidence: float = 0.50,
+        model_path: Optional[str] = None,
+        inference_interval: float = 0.12,
     ):
         self.min_area = min_area
         self.var_threshold = var_threshold
@@ -35,6 +53,21 @@ class MotionDetector:
         self.consecutive_frames_required = max(1, consecutive_frames_required)
         self.consecutive_count = 0
         self.exclude_zones = list(exclude_zones) if exclude_zones else []
+
+        self.human_only = human_only
+        self.human_confidence = float(human_confidence)
+        self.model_path = model_path or DEFAULT_YOLO_MODEL_PATH
+        self.inference_interval = float(inference_interval)
+        self.net = None
+
+        # État interne pour le throttling intelligent de l'inférence IA
+        self.prev_tiny: Optional[np.ndarray] = None
+        self.last_inference_time: float = 0.0
+        self.last_boxes: List[Tuple[int, int, int, int]] = []
+        self.last_scores: List[float] = []
+
+        if self.human_only:
+            self._init_yolo_model()
 
         # Substracteur d'arrière-plan MOG2 de OpenCV
         self.fgbg = cv2.createBackgroundSubtractorMOG2(
@@ -45,6 +78,29 @@ class MotionDetector:
 
         self.kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         self.kernel_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+
+    def _init_yolo_model(self):
+        """Charge le modèle YOLOv8n ONNX (et le télécharge automatiquement s'il est absent)."""
+        try:
+            if not os.path.exists(self.model_path):
+                os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
+                logger.info(
+                    f"📥 Téléchargement du modèle IA de détection humaine (YOLOv8n ONNX) vers {self.model_path}..."
+                )
+                urllib.request.urlretrieve(DEFAULT_YOLO_MODEL_URL, self.model_path)
+                logger.info("✅ Modèle YOLOv8n téléchargé avec succès.")
+
+            self.net = cv2.dnn.readNetFromONNX(self.model_path)
+            logger.info(
+                f"🧠 Détection IA Humaine activée (modèle: {os.path.basename(self.model_path)}, "
+                f"seuil de confiance: {self.human_confidence * 100:.0f}%)."
+            )
+        except Exception as e:
+            logger.error(
+                f"⚠️ Impossible de charger le modèle IA YOLOv8n ({e}). Bascule sur le détecteur MOG2 classique."
+            )
+            self.net = None
+            self.human_only = False
 
     @staticmethod
     def resolve_zone_pixels(
@@ -130,17 +186,162 @@ class MotionDetector:
         cut_y = y + int(h * (1.0 - bottom_ratio))
         return (x, cut_y, x + w, y + h)
 
+    def _is_point_excluded(self, cx: float, cy: float, w: int, h: int) -> bool:
+        """Vérifie si le point central (cx, cy) se trouve dans une zone d'exclusion."""
+        if not self.exclude_zones:
+            return False
+        for zone in self.exclude_zones:
+            zx1, zy1, zx2, zy2 = self.resolve_zone_pixels(zone, w, h)
+            if zx1 <= cx <= zx2 and zy1 <= cy <= zy2:
+                return True
+        return False
+
+    def _detect_humans_yolo(
+        self, frame: np.ndarray
+    ) -> Tuple[List[Tuple[int, int, int, int]], List[float]]:
+        """
+        Exécute l'inférence YOLOv8n sur l'image et retourne uniquement les boîtes
+        englobantes (x, y, w, h) et scores de confiance de la classe 0 ('person').
+        """
+        h, w = frame.shape[:2]
+        scale = min(640.0 / w, 640.0 / h)
+        nw, nh = int(round(w * scale)), int(round(h * scale))
+        pad_w, pad_h = (640 - nw) // 2, (640 - nh) // 2
+
+        resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        canvas = np.full((640, 640, 3), 114, dtype=np.uint8)
+        canvas[pad_h : pad_h + nh, pad_w : pad_w + nw] = resized
+
+        blob = cv2.dnn.blobFromImage(
+            canvas, 1.0 / 255.0, (640, 640), swapRB=True, crop=False
+        )
+        self.net.setInput(blob)
+        outputs = self.net.forward()  # (1, 84, 8400)
+
+        preds = outputs[0]  # (84, 8400)
+        # Dans COCO (80 classes), la classe 0 ('person') est à l'indice 4 (après cx, cy, w, h)
+        person_scores = preds[4, :]
+        mask = person_scores >= self.human_confidence
+        if not np.any(mask):
+            return [], []
+
+        filtered_boxes = preds[:4, mask].T  # (N, 4)
+        filtered_scores = person_scores[mask]
+
+        raw_boxes = []
+        raw_scores = []
+        for (cx, cy, bw, bh), score in zip(filtered_boxes, filtered_scores):
+            x1 = (cx - bw / 2.0 - pad_w) / scale
+            y1 = (cy - bh / 2.0 - pad_h) / scale
+            box_w = bw / scale
+            box_h = bh / scale
+
+            ix = int(max(0, min(w - 1, round(x1))))
+            iy = int(max(0, min(h - 1, round(y1))))
+            iw = int(max(1, min(w - ix, round(box_w))))
+            ih = int(max(1, min(h - iy, round(box_h))))
+
+            if iw * ih < self.min_area:
+                continue
+
+            center_x = ix + iw / 2.0
+            center_y = iy + ih / 2.0
+            if self._is_point_excluded(center_x, center_y, w, h):
+                continue
+
+            raw_boxes.append([ix, iy, iw, ih])
+            raw_scores.append(float(score))
+
+        if not raw_boxes:
+            return [], []
+
+        indices = cv2.dnn.NMSBoxes(
+            raw_boxes, raw_scores, self.human_confidence, 0.45
+        )
+        final_boxes: List[Tuple[int, int, int, int]] = []
+        final_scores: List[float] = []
+        if len(indices) > 0:
+            for idx in np.array(indices).flatten():
+                bx, by, bw, bh = raw_boxes[idx]
+                final_boxes.append((bx, by, bw, bh))
+                final_scores.append(raw_scores[idx])
+
+        return final_boxes, final_scores
+
     def warmup(self, frame: np.ndarray):
         """Alimente le modèle d'arrière-plan sans déclencher d'alerte."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (21, 21), 0)
-        self.fgbg.apply(blurred)
+        self.prev_tiny = cv2.resize(gray, (64, 48), interpolation=cv2.INTER_AREA)
+        if not self.human_only:
+            blurred = cv2.GaussianBlur(gray, (21, 21), 0)
+            self.fgbg.apply(blurred)
+
+    def _process_frame_human_only(self, frame: np.ndarray) -> MotionResult:
+        """
+        Analyse la présence d'un humain par IA (YOLOv8n).
+        Optimise l'usage CPU en évitant de ré-exécuter le réseau si l'image est
+        strictement statique ou si une inférence vient tout juste d'être effectuée.
+        """
+        now = time.time()
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        tiny = cv2.resize(gray, (64, 48), interpolation=cv2.INTER_AREA)
+
+        scene_changed = True
+        if self.prev_tiny is not None:
+            mean_diff = float(np.mean(cv2.absdiff(tiny, self.prev_tiny)))
+            scene_changed = mean_diff > 1.2
+
+        # On lance l'inférence YOLO si :
+        # - un humain est en cours de confirmation (0 < consecutive_count < required), OU
+        # - l'intervalle d'inférence est écoulé ET la scène a évolué (ou un humain était déjà présent), OU
+        # - la scène vient de changer significativement
+        need_confirmation = 0 < self.consecutive_count < self.consecutive_frames_required
+        interval_elapsed = (now - self.last_inference_time) >= self.inference_interval
+        heartbeat_elapsed = (now - self.last_inference_time) >= 0.40
+
+        if need_confirmation or (interval_elapsed and (scene_changed or self.consecutive_count > 0)) or heartbeat_elapsed or (scene_changed and self.last_inference_time == 0.0):
+            self.prev_tiny = tiny
+            self.last_inference_time = now
+            boxes, scores = self._detect_humans_yolo(frame)
+            self.last_boxes = boxes
+            self.last_scores = scores
+
+            if boxes:
+                self.consecutive_count += 1
+            else:
+                self.consecutive_count = 0
+        elif scene_changed:
+            # Si la scène change brusquement (ex: dans un test unitaire rapide sans délai)
+            self.prev_tiny = tiny
+            self.last_inference_time = now
+            boxes, scores = self._detect_humans_yolo(frame)
+            self.last_boxes = boxes
+            self.last_scores = scores
+
+            if boxes:
+                self.consecutive_count += 1
+            else:
+                self.consecutive_count = 0
+
+        confirmed = self.consecutive_count >= self.consecutive_frames_required
+        total_area = float(sum(w * h for (_, _, w, h) in self.last_boxes))
+
+        return MotionResult(
+            detected=confirmed,
+            moving_area=total_area,
+            contours_count=len(self.last_boxes),
+            bounding_boxes=list(self.last_boxes),
+            confidences=list(self.last_scores),
+        )
 
     def process_frame(self, frame: np.ndarray) -> MotionResult:
         """
-        Analyse une image et retourne le résultat de détection de mouvement.
-        Les mouvements situés dans les zones d'exclusion sont totalement ignorés.
+        Analyse une image et retourne le résultat de détection.
+        En mode human_only, seule la présence d'un humain déclenche une alerte.
         """
+        if self.human_only and self.net is not None:
+            return self._process_frame_human_only(frame)
+
         h, w = frame.shape[:2]
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (21, 21), 0)
@@ -198,11 +399,16 @@ class MotionDetector:
             moving_area=total_moving_area,
             contours_count=len(significant_boxes),
             bounding_boxes=significant_boxes,
+            confidences=[],
         )
 
     def reset(self):
         """Réinitialise les compteurs et recrée un modèle de fond vierge."""
         self.consecutive_count = 0
+        self.prev_tiny = None
+        self.last_inference_time = 0.0
+        self.last_boxes = []
+        self.last_scores = []
         self.fgbg = cv2.createBackgroundSubtractorMOG2(
             history=self.history,
             varThreshold=self.var_threshold,

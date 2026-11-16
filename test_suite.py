@@ -187,6 +187,8 @@ class TestIntrusionDetection(unittest.TestCase):
             mock_cfg.min_area = 500
             mock_cfg.consecutive_frames = 2
             mock_cfg.exclude_zones = []
+            mock_cfg.human_only = True
+            mock_cfg.human_confidence = 0.50
             mock_cfg.resolution = (640, 480)
             mock_cfg.camera_index = 0
             mock_cfg.smtp_user = "user_name_test@domain.com"
@@ -225,6 +227,36 @@ class TestIntrusionDetection(unittest.TestCase):
             t0 = time.time()
             app.run_startup_delay()
             self.assertLess(time.time() - t0, 1.0, "Le délai d'attente doit s'interrompre immédiatement en cas de pause")
+
+    def test_human_only_detector_ignores_lighting_changes(self):
+        """Vérifie que le mode human_only (YOLOv8n) ignore totalement les variations de lumière."""
+        detector = MotionDetector(
+            min_area=500,
+            consecutive_frames_required=2,
+            human_only=True,
+            human_confidence=0.50,
+            inference_interval=0.0,
+        )
+        self.assertTrue(detector.human_only)
+        self.assertIsNotNone(detector.net)
+
+        # 1. Image sombre puis flash lumineux massif (changement d'éclairage global + rectangle blanc)
+        dark_frame = np.ones((480, 640, 3), dtype=np.uint8) * 40
+        bright_frame = np.ones((480, 640, 3), dtype=np.uint8) * 210
+        cv2.rectangle(bright_frame, (100, 100), (450, 400), (255, 255, 255), -1)
+
+        detector.warmup(dark_frame)
+        res1 = detector.process_frame(bright_frame)
+        res2 = detector.process_frame(bright_frame)
+        self.assertFalse(
+            res1.detected,
+            "Une variation de lumière ne doit jamais déclencher le détecteur humain !",
+        )
+        self.assertFalse(
+            res2.detected,
+            "Une variation de lumière ne doit jamais déclencher le détecteur humain !",
+        )
+        self.assertEqual(res2.contours_count, 0)
 
 
 if __name__ == "__main__":

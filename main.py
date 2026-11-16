@@ -64,11 +64,13 @@ class IntrusionDetectionApp:
             on_photo_request=self.capture_live_photo,
         )
 
-        # Initialisation du détecteur de mouvement
+        # Initialisation du détecteur de mouvement / présence humaine
         self.detector = MotionDetector(
             min_area=self.config.min_area,
             consecutive_frames_required=self.config.consecutive_frames,
             exclude_zones=self.config.exclude_zones,
+            human_only=self.config.human_only,
+            human_confidence=self.config.human_confidence,
         )
 
         # Variables pour la gestion des zones d'exclusion
@@ -298,9 +300,16 @@ class IntrusionDetectionApp:
             clean_email = (self.config.smtp_user or "").replace("_", "\\_")
             email_state = f"Actives ({clean_email})"
 
+        det_mode = (
+            f"🧠 *IA Humain uniquement* (YOLOv8n ≥ {self.detector.human_confidence * 100:.0f}%)"
+            if self.detector.human_only
+            else "Classique (Mouvement pixels MOG2)"
+        )
+
         return (
             f"🛡️ *État du système de vidéosurveillance :*\n\n"
             f"• État : {state_str}\n"
+            f"• Détection : {det_mode}\n"
             f"• Matériel caméra : *{cam_state}* (#{self.config.camera_index}, {res_str} @ {self.fps:.0f} FPS)\n"
             f"• Alertes e-mail : {email_state}\n"
             f"• Alertes déclenchées : {self.alerts_count}\n"
@@ -547,19 +556,24 @@ class IntrusionDetectionApp:
             if self.mouse_dragging and self.mouse_start and self.mouse_current:
                 cv2.rectangle(preview, self.mouse_start, self.mouse_current, (0, 255, 255), 2)
 
-            # 5. Dessin des zones de mouvement en direct
+            # 5. Dessin des zones de mouvement / présence humaine en direct
             if motion_result and motion_result.bounding_boxes:
                 box_color = (0, 0, 255) if motion_result.detected else (0, 255, 0)
-                for (bx, by, bw, bh) in motion_result.bounding_boxes:
+                confs = getattr(motion_result, "confidences", None) or []
+                for idx, (bx, by, bw, bh) in enumerate(motion_result.bounding_boxes):
                     cv2.rectangle(preview, (bx, by), (bx + bw, by + bh), box_color, 2)
+                    if idx < len(confs):
+                        label = f"HUMAIN {confs[idx] * 100:.0f}% ({bw * bh} px)"
+                    else:
+                        label = f"{bw * bh} px"
                     cv2.putText(
                         preview,
-                        f"{bw * bh} px",
+                        label,
                         (bx, max(15, by - 5)),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45,
+                        0.50,
                         box_color,
-                        1,
+                        2,
                         cv2.LINE_AA,
                     )
 
@@ -583,9 +597,14 @@ class IntrusionDetectionApp:
 
             # Texte inférieur : indicateurs techniques
             motion_px = motion_result.moving_area if motion_result else 0
+            mode_label = (
+                f"IA Humain (>={self.detector.human_confidence * 100:.0f}%)"
+                if self.detector.human_only
+                else f"Pixels (Seuil: {self.config.min_area} px)"
+            )
             status_txt = (
-                f"Res: {w}x{h} | FPS: {self.fps:.0f} | Mouvement: {motion_px:.0f} px "
-                f"(Seuil: {self.config.min_area} px) | État: {state_str}"
+                f"Res: {w}x{h} | FPS: {self.fps:.0f} | Mode: {mode_label} "
+                f"| Surface: {motion_px:.0f} px | État: {state_str}"
             )
             cv2.putText(
                 preview,
@@ -802,9 +821,16 @@ class IntrusionDetectionApp:
 
                     if motion.detected:
                         self.alerts_count += 1
-                        logger.warning(
-                            f"🚨 MOUVEMENT DÉTECTÉ à {now_time_str} ! (surface: {motion.moving_area:.0f} px)"
-                        )
+                        if motion.confidences:
+                            max_conf = max(motion.confidences) * 100
+                            logger.warning(
+                                f"🚨 PRÉSENCE HUMAINE DÉTECTÉE à {now_time_str} ! "
+                                f"(confiance: {max_conf:.0f}%, surface: {motion.moving_area:.0f} px)"
+                            )
+                        else:
+                            logger.warning(
+                                f"🚨 MOUVEMENT DÉTECTÉ à {now_time_str} ! (surface: {motion.moving_area:.0f} px)"
+                            )
 
                         # Démarrage immédiat de l'enregistrement de 3 secondes à T=0
                         with self.segment_lock:
